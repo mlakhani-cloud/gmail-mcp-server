@@ -1,0 +1,1154 @@
+import express, { Request, Response, NextFunction } from "express";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { google } from "googleapis";
+import { z } from "zod";
+import { GmailService } from "./gmail-service.js";
+import { DriveService } from "./drive-service.js";
+import { DocsService, NAMED_STYLES } from "./docs-service.js";
+import { TokenStore } from "./token-store.js";
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
+const SCOPES = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/documents",
+  "https://www.googleapis.com/auth/userinfo.email",
+];
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+const tokenStore = new TokenStore();
+
+// ---------------------------------------------------------------------------
+// Gmail service factory — exchanges stored refresh token for access token
+// ---------------------------------------------------------------------------
+
+function makeOAuth2Client() {
+  return new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    `${SERVER_URL}/oauth/callback`
+  );
+}
+
+async function getAccessTokenForAccount(email: string): Promise<string> {
+  const refreshToken = tokenStore.getRefreshToken(email);
+  if (!refreshToken) {
+    throw new Error(
+      `Account "${email}" is not connected. Use list_accounts to see connected accounts, or add it via the /setup page.`
+    );
+  }
+
+  const oauth2 = makeOAuth2Client();
+  oauth2.setCredentials({ refresh_token: refreshToken });
+
+  const { token } = await oauth2.getAccessToken();
+  if (!token) {
+    throw new Error(
+      `Failed to get access token for "${email}". The account may need to be re-authorized via /setup.`
+    );
+  }
+
+  return token;
+}
+
+async function getGmailServiceForAccount(email: string): Promise<GmailService> {
+  return new GmailService(await getAccessTokenForAccount(email));
+}
+
+async function getDriveServiceForAccount(email: string): Promise<DriveService> {
+  return new DriveService(await getAccessTokenForAccount(email));
+}
+
+async function getDocsServiceForAccount(email: string): Promise<DocsService> {
+  return new DocsService(await getAccessTokenForAccount(email));
+}
+
+function resolveAccounts(account: string): string[] {
+  if (account.toLowerCase() === "all") {
+    const all = tokenStore.listAccounts().map((a) => a.email);
+    if (all.length === 0) {
+      throw new Error("No accounts connected. Add accounts via the /setup page.");
+    }
+    return all;
+  }
+  if (!tokenStore.hasAccount(account)) {
+    const available = tokenStore.listAccounts().map((a) => a.email);
+    throw new Error(
+      `Account "${account}" is not connected. Available accounts: ${available.join(", ") || "none"}`
+    );
+  }
+  return [account];
+}
+
+// ---------------------------------------------------------------------------
+// MCP server factory — registers all tools
+// ---------------------------------------------------------------------------
+
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: "gmail-mcp-server",
+    version: "1.0.0",
+  });
+
+  // ---- list_accounts ----
+  server.tool(
+    "list_accounts",
+    "List all connected Google accounts. Each account covers both Gmail and Google Drive. Use the email addresses returned here as the 'account' parameter in other tools.",
+    {},
+    async () => {
+      const accounts = tokenStore.listAccounts();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                connected_accounts: accounts,
+                usage_hint:
+                  "Use any email address as the 'account' parameter, or use 'all' to query every account.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- list_emails ----
+  server.tool(
+    "list_emails",
+    "Search and list emails. Supports Gmail search syntax (is:unread, from:, newer_than:7d, etc). Use account='all' to search across all connected accounts.",
+    {
+      account: z
+        .string()
+        .describe(
+          "Email address of the account to search, or 'all' for every connected account"
+        ),
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Gmail search query (e.g. 'is:unread', 'from:user@example.com newer_than:2d', 'subject:invoice')"
+        ),
+      max_results: z
+        .number()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe("Maximum number of emails to return per account (1-100)"),
+    },
+    async ({ account, query, max_results }) => {
+      const accounts = resolveAccounts(account);
+      const allResults: Array<{ account: string; emails: any[] }> = [];
+
+      for (const email of accounts) {
+        try {
+          const gmail = await getGmailServiceForAccount(email);
+          const emails = await gmail.listEmails(query, max_results);
+          allResults.push({ account: email, emails });
+        } catch (err: any) {
+          allResults.push({
+            account: email,
+            emails: [],
+          });
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(allResults, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- get_email ----
+  server.tool(
+    "get_email",
+    "Get the full content of a specific email including body, headers, and any unsubscribe links found.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const email = await gmail.getEmail(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...email }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- archive_email ----
+  server.tool(
+    "archive_email",
+    "Archive an email by removing it from the inbox. The email remains accessible via search or All Mail.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID to archive"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.archiveEmail(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Email ${message_id} archived successfully.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- apply_label ----
+  server.tool(
+    "apply_label",
+    "Apply a label to an email. Creates the label if it does not already exist.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+      label_name: z
+        .string()
+        .describe(
+          "Label name to apply (e.g. 'Receipts', 'Follow Up'). Created automatically if it does not exist."
+        ),
+    },
+    async ({ account, message_id, label_name }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.applyLabel(message_id, label_name);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Label "${label_name}" applied to email ${message_id}.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- unsubscribe_email ----
+  server.tool(
+    "unsubscribe_email",
+    "Attempt to unsubscribe from a mailing list. Tries List-Unsubscribe header (HTTP and mailto), then scans the email body for unsubscribe links.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z
+        .string()
+        .describe("The Gmail message ID to unsubscribe from"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.unsubscribeEmail(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- batch_process ----
+  server.tool(
+    "batch_process",
+    "Fetch a batch of emails matching a query for triage. Returns structured data so you can decide which actions to take on each email. Use account='all' to scan all accounts.",
+    {
+      account: z
+        .string()
+        .describe(
+          "Email address of the account to search, or 'all' for every connected account"
+        ),
+      query: z
+        .string()
+        .describe(
+          "Gmail search query (e.g. 'is:unread category:promotions', 'newer_than:7d')"
+        ),
+      max_results: z
+        .number()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe("Maximum number of emails to fetch per account"),
+    },
+    async ({ account, query, max_results }) => {
+      const accounts = resolveAccounts(account);
+      const allResults: Array<{ account: string; emails: any[] }> = [];
+
+      for (const email of accounts) {
+        try {
+          const gmail = await getGmailServiceForAccount(email);
+          const emails = await gmail.batchProcess(query, max_results);
+          allResults.push({ account: email, emails });
+        } catch (err: any) {
+          allResults.push({ account: email, emails: [] });
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                total: allResults.reduce((n, r) => n + r.emails.length, 0),
+                query,
+                results: allResults,
+                hint: "Review each email and decide whether to archive, label, unsubscribe, or skip. Use the individual tools with the correct account parameter.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // =========================================================================
+  // Google Drive tools
+  // =========================================================================
+
+  // ---- drive_search ----
+  server.tool(
+    "drive_search",
+    "Search Google Drive files. Accepts either plain keywords (full-text search) or Drive query syntax (e.g. \"mimeType = 'application/vnd.google-apps.spreadsheet'\", \"name contains 'budget'\", \"modifiedTime > '2026-01-01'\"). Use account='all' to search every connected account at once.",
+    {
+      account: z
+        .string()
+        .describe(
+          "Email address of the account to search, or 'all' for every connected account"
+        ),
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Keywords for full-text search, or Drive query syntax. Omit to list recently modified files."
+        ),
+      max_results: z
+        .number()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe("Maximum number of files to return per account (1-100)"),
+      include_trashed: z
+        .boolean()
+        .default(false)
+        .describe("Include files in the trash"),
+    },
+    async ({ account, query, max_results, include_trashed }) => {
+      const accounts = resolveAccounts(account);
+      const allResults: Array<{ account: string; files: any[]; error?: string }> = [];
+
+      for (const email of accounts) {
+        try {
+          const drive = await getDriveServiceForAccount(email);
+          const files = await drive.searchFiles(query, max_results, include_trashed);
+          allResults.push({ account: email, files });
+        } catch (err: any) {
+          allResults.push({ account: email, files: [], error: err.message });
+        }
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(allResults, null, 2) },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_get_file ----
+  server.tool(
+    "drive_get_file",
+    "Read a Google Drive file. Google Docs are exported as plain text, Sheets as CSV, Slides as text. Folders return a listing of their contents. Binary files return metadata only.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account that owns this file"),
+      file_id: z.string().describe("The Drive file ID"),
+    },
+    async ({ account, file_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const file = await drive.getFile(file_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...file }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_create_file ----
+  server.tool(
+    "drive_create_file",
+    "Create a new file in Google Drive from text content. Set as_google_doc=true to convert it into a native Google Doc (or Google Sheet, when mime_type is text/csv) rather than storing a plain text file.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account to create the file in"),
+      name: z.string().describe("File name, including extension if relevant"),
+      content: z.string().describe("Text content of the file"),
+      mime_type: z
+        .string()
+        .default("text/plain")
+        .describe(
+          "Source MIME type of the content, e.g. text/plain, text/csv, text/markdown, text/html"
+        ),
+      folder_id: z
+        .string()
+        .optional()
+        .describe("Drive folder ID to create the file in. Omit for My Drive root."),
+      as_google_doc: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Convert to a native Google Doc or Sheet instead of keeping the raw file"
+        ),
+    },
+    async ({ account, name, content, mime_type, folder_id, as_google_doc }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.createFile(name, content, {
+        mimeType: mime_type,
+        folderId: folder_id,
+        asGoogleDoc: as_google_doc,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Created "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_create_folder ----
+  server.tool(
+    "drive_create_folder",
+    "Create a new folder in Google Drive.",
+    {
+      account: z.string().describe("Email address of the account"),
+      name: z.string().describe("Folder name"),
+      parent_id: z
+        .string()
+        .optional()
+        .describe("Parent folder ID. Omit to create in My Drive root."),
+    },
+    async ({ account, name, parent_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.createFolder(name, parent_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Created folder "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_update_file ----
+  server.tool(
+    "drive_update_file",
+    "Replace the contents of an existing Drive file. Works on Google Docs and Sheets too — send text/plain for a Doc or text/csv for a Sheet and Drive converts it. This overwrites the file, it does not append.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to update"),
+      content: z.string().describe("New content, replacing what is there now"),
+      mime_type: z
+        .string()
+        .default("text/plain")
+        .describe("MIME type of the content you are sending"),
+    },
+    async ({ account, file_id, content, mime_type }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.updateFileContent(file_id, content, mime_type);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Updated "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_rename_file ----
+  server.tool(
+    "drive_rename_file",
+    "Rename a Drive file or folder.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID"),
+      name: z.string().describe("New name"),
+    },
+    async ({ account, file_id, name }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.renameFile(file_id, name);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Renamed to "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_move_file ----
+  server.tool(
+    "drive_move_file",
+    "Move a Drive file into a different folder. Removes it from its current folders.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to move"),
+      folder_id: z.string().describe("Destination folder ID"),
+    },
+    async ({ account, file_id, folder_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.moveFile(file_id, folder_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Moved "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_trash_file ----
+  server.tool(
+    "drive_trash_file",
+    "Move a Drive file to the trash. This is recoverable — it does not permanently delete. Deliberately there is no permanent-delete tool.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to trash"),
+    },
+    async ({ account, file_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.trashFile(file_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Moved "${result.name}" to trash. Recoverable from Drive's trash for 30 days.`,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // =========================================================================
+  // Google Docs tools — positional editing
+  // =========================================================================
+
+  const docsOut = (payload: unknown) => ({
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  });
+
+  // ---- docs_read ----
+  server.tool(
+    "docs_read",
+    "Read a Google Doc as a paragraph-level outline WITH character indices. Call this before any positional edit — every other docs_ tool needs these indices, and they shift after each edit, so re-read between edits.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z
+        .string()
+        .describe("The Doc ID (same as the Drive file ID for a Google Doc)"),
+    },
+    async ({ account, document_id }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({ account, ...(await docs.readDocument(document_id)) });
+    }
+  );
+
+  // ---- docs_replace_text ----
+  server.tool(
+    "docs_replace_text",
+    "Find and replace text throughout a Google Doc, preserving all surrounding formatting. This is the safest edit — it needs no indices and cannot corrupt document structure. Prefer it over positional edits whenever the target text is unique.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      find: z.string().describe("Exact text to find"),
+      replace: z.string().describe("Text to replace it with. Empty string deletes it."),
+      match_case: z.boolean().default(true).describe("Case-sensitive matching"),
+    },
+    async ({ account, document_id, find, replace, match_case }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.replaceText(document_id, find, replace, match_case)),
+      });
+    }
+  );
+
+  // ---- docs_insert_text ----
+  server.tool(
+    "docs_insert_text",
+    "Insert text at a specific character index in a Google Doc. Get the index from docs_read first. Everything already in the document is preserved.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      index: z
+        .number()
+        .describe("Character index to insert at, from docs_read"),
+      text: z
+        .string()
+        .describe("Text to insert. Include a trailing \\n to end the paragraph."),
+    },
+    async ({ account, document_id, index, text }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.insertText(document_id, index, text)),
+      });
+    }
+  );
+
+  // ---- docs_append_text ----
+  server.tool(
+    "docs_append_text",
+    "Append text to the very end of a Google Doc. No index needed.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      text: z.string().describe("Text to append"),
+    },
+    async ({ account, document_id, text }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({ account, ...(await docs.appendText(document_id, text)) });
+    }
+  );
+
+  // ---- docs_delete_range ----
+  server.tool(
+    "docs_delete_range",
+    "Delete a character range from a Google Doc. Get indices from docs_read. This is destructive and there is no undo through the API — the user can still undo in the Docs UI or restore via version history.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      start_index: z.number().describe("First character to delete"),
+      end_index: z.number().describe("One past the last character to delete"),
+    },
+    async ({ account, document_id, start_index, end_index }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.deleteRange(document_id, start_index, end_index)),
+      });
+    }
+  );
+
+  // ---- docs_format_text ----
+  server.tool(
+    "docs_format_text",
+    "Apply character formatting (bold, italic, underline, strikethrough, font size, hyperlink) to a range in a Google Doc. Get indices from docs_read.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      start_index: z.number().describe("Start of the range"),
+      end_index: z.number().describe("End of the range"),
+      bold: z.boolean().optional(),
+      italic: z.boolean().optional(),
+      underline: z.boolean().optional(),
+      strikethrough: z.boolean().optional(),
+      font_size: z.number().optional().describe("Font size in points"),
+      link_url: z.string().optional().describe("Turn the range into a hyperlink"),
+    },
+    async ({
+      account,
+      document_id,
+      start_index,
+      end_index,
+      bold,
+      italic,
+      underline,
+      strikethrough,
+      font_size,
+      link_url,
+    }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.formatText(document_id, start_index, end_index, {
+          bold,
+          italic,
+          underline,
+          strikethrough,
+          fontSize: font_size,
+          linkUrl: link_url,
+        })),
+      });
+    }
+  );
+
+  // ---- docs_set_paragraph_style ----
+  server.tool(
+    "docs_set_paragraph_style",
+    "Set the named paragraph style (Title, Subtitle, Heading 1-6, Normal) on a range. This is what makes headings appear in the document outline.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      start_index: z.number().describe("Start of the range"),
+      end_index: z.number().describe("End of the range"),
+      style: z
+        .enum(NAMED_STYLES)
+        .describe("Named style to apply"),
+    },
+    async ({ account, document_id, start_index, end_index, style }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.setParagraphStyle(document_id, start_index, end_index, style)),
+      });
+    }
+  );
+
+  // ---- docs_set_bullets ----
+  server.tool(
+    "docs_set_bullets",
+    "Turn a range of paragraphs into a bulleted or numbered list.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      start_index: z.number().describe("Start of the range"),
+      end_index: z.number().describe("End of the range"),
+      numbered: z.boolean().default(false).describe("Numbered instead of bulleted"),
+    },
+    async ({ account, document_id, start_index, end_index, numbered }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.setBullets(document_id, start_index, end_index, numbered)),
+      });
+    }
+  );
+
+  // ---- docs_insert_table ----
+  server.tool(
+    "docs_insert_table",
+    "Insert an empty table at a character index in a Google Doc. Fill cells afterwards with docs_insert_text using indices from a fresh docs_read.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      index: z.number().describe("Character index to insert the table at"),
+      rows: z.number().min(1).max(100).describe("Number of rows"),
+      columns: z.number().min(1).max(20).describe("Number of columns"),
+    },
+    async ({ account, document_id, index, rows, columns }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.insertTable(document_id, index, rows, columns)),
+      });
+    }
+  );
+
+  // ---- docs_insert_page_break ----
+  server.tool(
+    "docs_insert_page_break",
+    "Insert a page break at a character index in a Google Doc.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      index: z.number().describe("Character index for the break"),
+    },
+    async ({ account, document_id, index }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.insertPageBreak(document_id, index)),
+      });
+    }
+  );
+
+  // ---- docs_add_comment ----
+  server.tool(
+    "docs_add_comment",
+    "Add a comment to a Google Doc. Optionally quote a passage so the comment attaches to it. Use this instead of editing when you want to raise a point rather than change the text — the Docs API cannot create tracked suggestions, so comments are the non-destructive option.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      content: z.string().describe("The comment text"),
+      quoted_text: z
+        .string()
+        .optional()
+        .describe("Passage from the document this comment refers to"),
+    },
+    async ({ account, document_id, content, quoted_text }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        ...(await docs.addComment(document_id, content, quoted_text)),
+      });
+    }
+  );
+
+  // ---- docs_list_comments ----
+  server.tool(
+    "docs_list_comments",
+    "List comments on a Google Doc, including replies.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      include_resolved: z.boolean().default(false).describe("Include resolved comments"),
+    },
+    async ({ account, document_id, include_resolved }) => {
+      const docs = await getDocsServiceForAccount(account);
+      return docsOut({
+        account,
+        comments: await docs.listComments(document_id, include_resolved),
+      });
+    }
+  );
+
+  // ---- docs_reply_to_comment ----
+  server.tool(
+    "docs_reply_to_comment",
+    "Reply to an existing comment on a Google Doc, or resolve it.",
+    {
+      account: z.string().describe("Email address of the account that owns the doc"),
+      document_id: z.string().describe("The Doc ID"),
+      comment_id: z.string().describe("Comment ID from docs_list_comments"),
+      content: z.string().optional().describe("Reply text. Omit when only resolving."),
+      resolve: z.boolean().default(false).describe("Mark the comment resolved"),
+    },
+    async ({ account, document_id, comment_id, content, resolve }) => {
+      const docs = await getDocsServiceForAccount(account);
+      const out: Record<string, unknown> = { account, document_id, comment_id };
+
+      if (content) {
+        out.reply = await docs.replyToComment(document_id, comment_id, content);
+      }
+      if (resolve) {
+        out.resolved = await docs.resolveComment(document_id, comment_id);
+      }
+      if (!content && !resolve) {
+        throw new Error("Pass content, resolve, or both.");
+      }
+
+      return docsOut(out);
+    }
+  );
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
+// Express app
+// ---------------------------------------------------------------------------
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ---------------------------------------------------------------------------
+// Admin auth middleware for /setup routes
+// ---------------------------------------------------------------------------
+
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const key =
+    req.query.key as string | undefined ??
+    req.headers["x-admin-key"] as string | undefined;
+
+  if (key !== ADMIN_PASSWORD) {
+    res.status(401).send(`
+      <html><body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
+        <h2>Admin Login</h2>
+        <form method="GET">
+          <input type="password" name="key" placeholder="Admin password" style="padding:8px;width:100%;box-sizing:border-box;margin-bottom:12px" />
+          <button type="submit" style="padding:8px 24px">Login</button>
+        </form>
+      </body></html>
+    `);
+    return;
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Setup page — manage connected Gmail accounts
+// ---------------------------------------------------------------------------
+
+app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
+  const accounts = tokenStore.listAccounts();
+  const key = _req.query.key as string;
+  const message = _req.query.message as string | undefined;
+
+  const accountRows = accounts.length > 0
+    ? accounts
+        .map(
+          (a) => `
+        <tr>
+          <td>${a.email}</td>
+          <td>${new Date(a.addedAt).toLocaleDateString()}</td>
+          <td>
+            <form method="POST" action="/setup/remove?key=${encodeURIComponent(key)}" style="display:inline">
+              <input type="hidden" name="email" value="${a.email}" />
+              <button type="submit" onclick="return confirm('Remove ${a.email}?')" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
+            </form>
+          </td>
+        </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="3" style="text-align:center;color:#888">No accounts connected yet</td></tr>`;
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Gmail MCP — Setup</title>
+      <style>
+        body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+        h1 { font-size: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; }
+        th { font-weight: 600; border-bottom: 2px solid #ddd; }
+        .btn { display: inline-block; padding: 10px 24px; background: #4285f4; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; }
+        .btn:hover { background: #3367d6; }
+        .msg { padding: 12px; background: #e8f5e9; border-radius: 6px; margin-bottom: 16px; }
+        .msg.error { background: #fce4ec; }
+      </style>
+    </head>
+    <body>
+      <h1>Gmail MCP Server — Setup</h1>
+      ${message ? `<div class="msg">${message}</div>` : ""}
+      <table>
+        <thead><tr><th>Account</th><th>Added</th><th></th></tr></thead>
+        <tbody>${accountRows}</tbody>
+      </table>
+      <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
+      ${accounts.length > 0 ? `
+      <div style="margin-top:24px;padding:16px;background:#fff3cd;border-radius:6px">
+        <strong>Important:</strong> After adding/removing accounts, copy the value below and paste it as the <code>TOKENS_DATA</code> environment variable in Railway. This ensures accounts survive redeploys.
+        <div style="margin-top:8px">
+          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${tokenStore.getTokensDataForExport()}</textarea>
+        </div>
+      </div>
+      ` : ""}
+      <hr style="margin-top:40px;border:none;border-top:1px solid #eee" />
+      <p style="color:#888;font-size:13px">
+        MCP endpoint: <code>${SERVER_URL}/mcp</code><br/>
+        Connected accounts: ${accounts.length}
+      </p>
+    </body>
+    </html>
+  `);
+});
+
+app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
+  const email = req.body.email;
+  const key = req.query.key as string;
+
+  if (email && tokenStore.hasAccount(email)) {
+    tokenStore.removeAccount(email);
+    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
+  } else {
+    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// OAuth flow — server-managed Google auth
+// ---------------------------------------------------------------------------
+
+app.get("/oauth/start", (req: Request, res: Response) => {
+  const key = req.query.key as string;
+  if (key !== ADMIN_PASSWORD) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2 = makeOAuth2Client();
+  const url = oauth2.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: SCOPES,
+    state: key, // pass admin key through OAuth flow
+  });
+
+  res.redirect(url);
+});
+
+app.get("/oauth/callback", async (req: Request, res: Response) => {
+  const code = req.query.code as string;
+  const state = req.query.state as string;
+  const error = req.query.error as string;
+
+  if (error) {
+    res.redirect(
+      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`OAuth error: ${error}`)}`
+    );
+    return;
+  }
+
+  if (!code) {
+    res.redirect(
+      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No authorization code received")}`
+    );
+    return;
+  }
+
+  try {
+    const oauth2 = makeOAuth2Client();
+    const { tokens } = await oauth2.getToken(code);
+
+    if (!tokens.refresh_token) {
+      res.redirect(
+        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No refresh token received. Try removing the app from your Google account permissions and re-adding.")}`
+      );
+      return;
+    }
+
+    // Get the user's email address
+    oauth2.setCredentials(tokens);
+    const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
+    const userInfo = await oauth2Api.userinfo.get();
+    const email = userInfo.data.email;
+
+    if (!email) {
+      res.redirect(
+        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("Could not determine email address")}`
+      );
+      return;
+    }
+
+    tokenStore.addAccount(email, tokens.refresh_token);
+
+    res.redirect(
+      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Successfully connected ${email}`)}`
+    );
+  } catch (err: any) {
+    console.error("[oauth/callback] Error:", err);
+    res.redirect(
+      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Error: ${err.message}`)}`
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    accounts: tokenStore.size,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP transport — Streamable HTTP (stateless: each request gets a fresh server)
+// ---------------------------------------------------------------------------
+
+app.post("/mcp", async (req: Request, res: Response) => {
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless — no session tracking
+    });
+
+    const mcpServer = createMcpServer();
+    await mcpServer.connect(transport);
+
+    await transport.handleRequest(req, res, req.body);
+
+    // Clean up after response is sent
+    res.on("close", () => {
+      mcpServer.close().catch(() => {});
+      transport.close().catch(() => {});
+    });
+  } catch (err: any) {
+    console.error("[mcp] Error handling request:", err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: err.message },
+        id: null,
+      });
+    }
+  }
+});
+
+app.get("/mcp", async (req: Request, res: Response) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "SSE streams not supported in stateless mode. Use POST." },
+    id: null,
+  });
+});
+
+app.delete("/mcp", async (req: Request, res: Response) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Session management not used in stateless mode." },
+    id: null,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+app.listen(PORT, () => {
+  console.log(`Gmail MCP server listening on port ${PORT}`);
+  console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
+  console.log(`  Setup page:    ${SERVER_URL}/setup`);
+  console.log(`  Health check:  ${SERVER_URL}/health`);
+  console.log(`  Accounts:      ${tokenStore.size}`);
+});
