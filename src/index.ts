@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { google } from "googleapis";
 import { z } from "zod";
 import { GmailService } from "./gmail-service.js";
+import { DriveService } from "./drive-service.js";
 import { TokenStore } from "./token-store.js";
 
 // ---------------------------------------------------------------------------
@@ -18,6 +19,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
 
@@ -39,7 +41,7 @@ function makeOAuth2Client() {
   );
 }
 
-async function getGmailServiceForAccount(email: string): Promise<GmailService> {
+async function getAccessTokenForAccount(email: string): Promise<string> {
   const refreshToken = tokenStore.getRefreshToken(email);
   if (!refreshToken) {
     throw new Error(
@@ -57,7 +59,15 @@ async function getGmailServiceForAccount(email: string): Promise<GmailService> {
     );
   }
 
-  return new GmailService(token);
+  return token;
+}
+
+async function getGmailServiceForAccount(email: string): Promise<GmailService> {
+  return new GmailService(await getAccessTokenForAccount(email));
+}
+
+async function getDriveServiceForAccount(email: string): Promise<DriveService> {
+  return new DriveService(await getAccessTokenForAccount(email));
 }
 
 function resolveAccounts(account: string): string[] {
@@ -90,7 +100,7 @@ function createMcpServer(): McpServer {
   // ---- list_accounts ----
   server.tool(
     "list_accounts",
-    "List all connected Gmail accounts. Use the email addresses returned here as the 'account' parameter in other tools.",
+    "List all connected Google accounts. Each account covers both Gmail and Google Drive. Use the email addresses returned here as the 'account' parameter in other tools.",
     {},
     async () => {
       const accounts = tokenStore.listAccounts();
@@ -325,6 +335,253 @@ function createMcpServer(): McpServer {
               null,
               2
             ),
+          },
+        ],
+      };
+    }
+  );
+
+  // =========================================================================
+  // Google Drive tools
+  // =========================================================================
+
+  // ---- drive_search ----
+  server.tool(
+    "drive_search",
+    "Search Google Drive files. Accepts either plain keywords (full-text search) or Drive query syntax (e.g. \"mimeType = 'application/vnd.google-apps.spreadsheet'\", \"name contains 'budget'\", \"modifiedTime > '2026-01-01'\"). Use account='all' to search every connected account at once.",
+    {
+      account: z
+        .string()
+        .describe(
+          "Email address of the account to search, or 'all' for every connected account"
+        ),
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Keywords for full-text search, or Drive query syntax. Omit to list recently modified files."
+        ),
+      max_results: z
+        .number()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe("Maximum number of files to return per account (1-100)"),
+      include_trashed: z
+        .boolean()
+        .default(false)
+        .describe("Include files in the trash"),
+    },
+    async ({ account, query, max_results, include_trashed }) => {
+      const accounts = resolveAccounts(account);
+      const allResults: Array<{ account: string; files: any[]; error?: string }> = [];
+
+      for (const email of accounts) {
+        try {
+          const drive = await getDriveServiceForAccount(email);
+          const files = await drive.searchFiles(query, max_results, include_trashed);
+          allResults.push({ account: email, files });
+        } catch (err: any) {
+          allResults.push({ account: email, files: [], error: err.message });
+        }
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(allResults, null, 2) },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_get_file ----
+  server.tool(
+    "drive_get_file",
+    "Read a Google Drive file. Google Docs are exported as plain text, Sheets as CSV, Slides as text. Folders return a listing of their contents. Binary files return metadata only.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account that owns this file"),
+      file_id: z.string().describe("The Drive file ID"),
+    },
+    async ({ account, file_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const file = await drive.getFile(file_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...file }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_create_file ----
+  server.tool(
+    "drive_create_file",
+    "Create a new file in Google Drive from text content. Set as_google_doc=true to convert it into a native Google Doc (or Google Sheet, when mime_type is text/csv) rather than storing a plain text file.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account to create the file in"),
+      name: z.string().describe("File name, including extension if relevant"),
+      content: z.string().describe("Text content of the file"),
+      mime_type: z
+        .string()
+        .default("text/plain")
+        .describe(
+          "Source MIME type of the content, e.g. text/plain, text/csv, text/markdown, text/html"
+        ),
+      folder_id: z
+        .string()
+        .optional()
+        .describe("Drive folder ID to create the file in. Omit for My Drive root."),
+      as_google_doc: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Convert to a native Google Doc or Sheet instead of keeping the raw file"
+        ),
+    },
+    async ({ account, name, content, mime_type, folder_id, as_google_doc }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.createFile(name, content, {
+        mimeType: mime_type,
+        folderId: folder_id,
+        asGoogleDoc: as_google_doc,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Created "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_create_folder ----
+  server.tool(
+    "drive_create_folder",
+    "Create a new folder in Google Drive.",
+    {
+      account: z.string().describe("Email address of the account"),
+      name: z.string().describe("Folder name"),
+      parent_id: z
+        .string()
+        .optional()
+        .describe("Parent folder ID. Omit to create in My Drive root."),
+    },
+    async ({ account, name, parent_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.createFolder(name, parent_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Created folder "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_update_file ----
+  server.tool(
+    "drive_update_file",
+    "Replace the contents of an existing Drive file. Works on Google Docs and Sheets too — send text/plain for a Doc or text/csv for a Sheet and Drive converts it. This overwrites the file, it does not append.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to update"),
+      content: z.string().describe("New content, replacing what is there now"),
+      mime_type: z
+        .string()
+        .default("text/plain")
+        .describe("MIME type of the content you are sending"),
+    },
+    async ({ account, file_id, content, mime_type }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.updateFileContent(file_id, content, mime_type);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Updated "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_rename_file ----
+  server.tool(
+    "drive_rename_file",
+    "Rename a Drive file or folder.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID"),
+      name: z.string().describe("New name"),
+    },
+    async ({ account, file_id, name }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.renameFile(file_id, name);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Renamed to "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_move_file ----
+  server.tool(
+    "drive_move_file",
+    "Move a Drive file into a different folder. Removes it from its current folders.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to move"),
+      folder_id: z.string().describe("Destination folder ID"),
+    },
+    async ({ account, file_id, folder_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.moveFile(file_id, folder_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, ...result, message: `Moved "${result.name}".` }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- drive_trash_file ----
+  server.tool(
+    "drive_trash_file",
+    "Move a Drive file to the trash. This is recoverable — it does not permanently delete. Deliberately there is no permanent-delete tool.",
+    {
+      account: z.string().describe("Email address of the account that owns the file"),
+      file_id: z.string().describe("The Drive file ID to trash"),
+    },
+    async ({ account, file_id }) => {
+      const drive = await getDriveServiceForAccount(account);
+      const result = await drive.trashFile(file_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Moved "${result.name}" to trash. Recoverable from Drive's trash for 30 days.`,
+            }, null, 2),
           },
         ],
       };
